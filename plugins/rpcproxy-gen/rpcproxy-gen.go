@@ -1,0 +1,266 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"log"
+	"os"
+	"strings"
+	"text/template"
+	"unicode"
+)
+
+type Package struct {
+	Package    string
+	Interfaces []*Interface
+}
+
+type Interface struct {
+	Name       string
+	Unexported string // uncapitalized
+	Methods    []*Method
+}
+
+type Method struct {
+	Name     string
+	In       []*Field
+	Out      []*Field
+	ErrIndex int // index of last error in Out
+}
+
+type Field struct {
+	Name     string
+	Exported string // capitalized
+	Type     string
+}
+
+func (i *Interface) String() string {
+	var w bytes.Buffer
+	fmt.Fprintf(&w, "type %s interface {\n", i.Name)
+	for _, m := range i.Methods {
+		fmt.Fprintf(&w, "  %s\n", m)
+	}
+	fmt.Fprint(&w, "}\n")
+	return w.String()
+}
+
+func (m *Method) String() string {
+	sig := fmt.Sprintf("%s(%s)", m.Name, joinFields(m.In))
+	if len(m.Out) == 0 {
+		return sig
+	}
+	results := joinFields(m.Out)
+	return fmt.Sprintf("%s (%s)", sig, results)
+}
+
+func emptyValue(f *Field) string {
+	typeStr := fmt.Sprint(f.Type)
+	switch typeStr {
+	case "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64", "byte", "rune", "uint", "int", "uintptr":
+		return "0"
+	case "float32", "float64":
+		return "0.0"
+	case "string":
+		return "\"\""
+	case "bool":
+		return "false"
+	case "error":
+		return "nil"
+	default:
+		if strings.HasPrefix(typeStr, "*") {
+			return "nil"
+		}
+		return typeStr + "{}"
+	}
+}
+
+func uncapitalize(s string) string {
+	a := []rune(s)
+	a[0] = unicode.ToLower(a[0])
+	return string(a)
+}
+
+func joinFields(fields []*Field) string {
+	strs := make([]string, 0, len(fields))
+	for _, field := range fields {
+		strs = append(strs, field.String())
+	}
+	return strings.Join(strs, ", ")
+}
+
+func (f *Field) String() string {
+	typeStr := f.Type
+	if f.Name == "" {
+		return fmt.Sprintf("%s", typeStr)
+	} else {
+		return fmt.Sprintf("%s %s", f.Name, typeStr)
+	}
+}
+
+func parseFile(path string) *Package {
+	fset := token.NewFileSet()
+	f, _ := parser.ParseFile(fset, path, nil, parser.ParseComments)
+
+	packageName := identifyPackage(f)
+	if packageName == "" {
+		log.Fatalf("Could not determine package name of %s", path)
+	}
+
+	var interfaces []*Interface
+
+	for _, decl := range f.Decls {
+		if genDecl, ok := decl.(*ast.GenDecl); ok {
+			for _, spec := range genDecl.Specs {
+				if iface, ok := convertInterface(spec); ok {
+					interfaces = append(interfaces, iface)
+				}
+			}
+		}
+	}
+
+	return &Package{packageName, interfaces}
+}
+
+func identifyPackage(f *ast.File) string {
+	if f.Name == nil {
+		return ""
+	}
+	return f.Name.Name
+}
+
+func convertInterface(spec ast.Spec) (*Interface, bool) {
+	typeSpec, ok := spec.(*ast.TypeSpec)
+	if !ok {
+		return nil, false
+	}
+	ifaceType, ok := typeSpec.Type.(*ast.InterfaceType)
+	// ifaceType.Incomplete?
+	if !ok {
+		return nil, false
+	}
+	methods := make([]*Method, 0, ifaceType.Methods.NumFields())
+	for _, method := range ifaceType.Methods.List {
+		if method, ok := convertMethod(method); ok {
+			methods = append(methods, method)
+		}
+	}
+	unexported := uncapitalize(typeSpec.Name.Name)
+	return &Interface{typeSpec.Name.Name, unexported, methods}, true
+}
+
+func convertMethod(method *ast.Field) (*Method, bool) {
+	funcType, ok := method.Type.(*ast.FuncType)
+	// FIXME would a method have 0 or multiple names?
+	if !ok || len(method.Names) != 1 || !method.Names[0].IsExported() {
+		return nil, false
+	}
+	name := method.Names[0].Name
+	params := convertFieldList(funcType.Params)
+	results := convertFieldList(funcType.Results)
+	errIndex := lastErrFieldIndex(funcType.Results)
+	return &Method{name, params, results, errIndex}, true
+}
+
+func lastErrFieldIndex(fields *ast.FieldList) int {
+	idx := -1
+	if fields == nil {
+		return idx
+	}
+	for i, field := range fields.List {
+		if convertType(field.Type) == "error" {
+			idx = i
+		}
+	}
+	return idx
+}
+
+func convertFieldList(fields *ast.FieldList) []*Field {
+	result := make([]*Field, 0, fields.NumFields())
+	if fields != nil {
+		for _, field := range fields.List {
+			if field.Names == nil {
+				t := convertType(field.Type)
+				result = append(result, &Field{"", "", t})
+			} else {
+				for _, name := range field.Names {
+					t := convertType(field.Type)
+					result = append(result, &Field{name.Name, strings.Title(name.Name), t})
+				}
+			}
+		}
+	}
+	return result
+}
+
+func convertField(field *ast.Field) *Field {
+	name := ""
+	if len(field.Names) == 1 {
+		name = field.Names[0].Name
+	}
+	t := convertType(field.Type)
+	return &Field{name, strings.Title(name), t}
+}
+
+func convertType(t ast.Expr) string {
+	// FIXME: doesn't support pointers
+	str := fmt.Sprint(t)
+	if strings.HasPrefix(str, "&{") {
+		str = strings.Replace(str[2:len(str)-1], " ", ".", -1)
+	}
+	return str
+}
+
+var fns = template.FuncMap{
+	"plus1": func(x int) int {
+		return x + 1
+	},
+	"empty": func(o interface{}) string {
+		return emptyValue(o.(*Field))
+	},
+}
+
+var proxyTemplate = `// generated by rpcproxy-gen -- DO NOT EDIT
+package {{.Package}}
+
+import "github.com/docker/docker/plugins"
+
+{{range $_, $iface := .Interfaces}}
+// {{.Name}}
+
+type {{.Unexported}}Proxy struct {
+	client *plugins.Client
+}
+{{range $_, $method := .Methods}}
+type {{$iface.Unexported}}_{{.Name}}_Args struct {
+{{range .In}}	{{.Exported}} {{.Type}}
+{{end}}}
+
+type {{$iface.Unexported}}_{{.Name}}_Return struct {
+{{range .Out}}	{{.Exported}} {{.Type}}
+{{end}}}
+
+func (p *{{$iface.Unexported}}Proxy) {{.}} {
+	args := {{$iface.Unexported}}_{{.Name}}_Args{ {{range .In}}
+		{{.Name}},{{end}}
+	}
+	var ret {{$iface.Unexported}}_{{.Name}}_Return
+	if err := p.client.Call("{{$iface.Name}}.{{.Name}}", args, &ret); err != nil {
+		return {{$n := len .Out}}{{range $i, $e := .Out}}{{if eq $method.ErrIndex $i}}err{{else}}{{empty $e}}{{end}}{{if ne (plus1 $i) $n}}, {{end}}{{end}}
+	}
+	return {{$n := len .Out}}{{range $i, $e := .Out}}ret.{{$e.Exported}}{{if ne (plus1 $i) $n}}, {{end}}{{end}}
+}
+
+{{end}}{{end}}`
+
+func main() {
+	filePath := os.Args[1]
+	tmpl := template.Must(template.New("render").Funcs(fns).Parse(proxyTemplate))
+
+	pkg := parseFile(filePath)
+	if len(pkg.Interfaces) > 0 {
+		tmpl.Execute(os.Stdout, pkg)
+	}
+}

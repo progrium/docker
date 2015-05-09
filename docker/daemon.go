@@ -21,8 +21,10 @@ import (
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/timeutils"
-	"github.com/docker/docker/plugins"
 	"github.com/docker/docker/registry"
+
+	"github.com/docker/docker/plugins"
+	_ "github.com/docker/docker/volume/plugin"
 )
 
 const CanDaemon = true
